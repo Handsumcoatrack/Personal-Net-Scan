@@ -1,0 +1,49 @@
+import socket
+from datetime import datetime
+
+def scan_port(target, port):
+    """
+    Scan a single port on the target host
+    Returns True if port is open, False otherwise
+    """
+    try:
+        # Create a socket object
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)  # 1 second timeout
+        
+        # Attempt to connect
+        result = sock.connect_ex((target, port))
+        sock.close()
+        
+        return result == 0  # 0 means connection successful
+    except socket.error:
+        return False
+
+def scan_ports(target, ports):
+    """
+    Scan multiple ports on a target host
+    """
+    print(f"\nScanning {target}")
+    print(f"Started at {datetime.now()}\n")
+    print("-" * 50)
+    
+    open_ports = []
+    
+    for port in ports:
+        if scan_port(target, port):
+            print(f"Port {port}: OPEN")
+            open_ports.append(port)
+    
+    print("-" * 50)
+    print(f"\nScan completed at {datetime.now()}")
+    print(f"Found {len(open_ports)} open ports")
+    
+    return open_ports
+
+# Example usage - ONLY scan localhost or systems you own
+if __name__ == "__main__":
+    # Scan common ports on localhost
+    target = "127.0.0.1"  # localhost - always safe to scan
+    common_ports = [21, 22, 23, 25, 80, 443, 3306, 8080]
+    
+    open_ports = scan_ports(target, common_ports)
