@@ -1,49 +1,258 @@
 import socket
+import sys
 from datetime import datetime
+import threading
+from queue import Queue
 
-def scan_port(target, port):
+class PortScanner:
+    def __init__(self, target, timeout=1):
+        """
+        Initialize the port scanner
+        
+        Args:
+            target: IP address or hostname to scan
+            timeout: Connection timeout in seconds
+        """
+        self.target = target
+        self.timeout = timeout
+        self.open_ports = []
+        self.lock = threading.Lock()
+        
+    def grab_banner(self, port):
+        """
+        Attempt to grab the service banner from an open port
+        
+        Args:
+            port: Port number to grab banner from
+            
+        Returns:
+            Banner string or None if unable to grab
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            sock.connect((self.target, port))
+            
+            # Try to receive banner (some services send immediately)
+            try:
+                banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+                if banner:
+                    sock.close()
+                    return banner
+            except:
+                pass
+            
+            # For services that need a request first (like HTTP)
+            if port in [80, 8080, 443, 8443]:
+                # Send HTTP request
+                sock.send(b"GET / HTTP/1.1\r\nHost: " + self.target.encode() + b"\r\n\r\n")
+                banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+                sock.close()
+                # Extract just the Server header if present
+                for line in banner.split('\n'):
+                    if 'Server:' in line or 'server:' in line:
+                        return line.strip()
+                return banner.split('\n')[0] if banner else "HTTP Service (no banner)"
+            
+            # For SMTP (port 25)
+            elif port == 25:
+                sock.send(b"HELO test\r\n")
+                banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
+                sock.close()
+                return banner
+            
+            sock.close()
+            return None
+            
+        except Exception as e:
+            return None
+    
+    def scan_port(self, port):
+        """
+        Scan a single port and grab banner if open
+        
+        Args:
+            port: Port number to scan
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            result = sock.connect_ex((self.target, port))
+            sock.close()
+            
+            if result == 0:
+                # Port is open, try to grab banner
+                banner = self.grab_banner(port)
+                service = self.identify_service(port, banner)
+                
+                with self.lock:
+                    port_info = {
+                        'port': port,
+                        'service': service,
+                        'banner': banner
+                    }
+                    self.open_ports.append(port_info)
+                    
+                    # Print result immediately
+                    banner_text = f" - {banner[:60]}..." if banner and len(banner) > 60 else f" - {banner}" if banner else ""
+                    print(f"Port {port:5d}: OPEN    [{service}]{banner_text}")
+                    
+        except socket.error:
+            pass
+    
+    def identify_service(self, port, banner=None):
+        """
+        Identify common services by port number and banner
+        
+        Args:
+            port: Port number
+            banner: Banner text (optional)
+            
+        Returns:
+            Service name string
+        """
+        common_ports = {
+            20: "FTP-DATA", 21: "FTP", 22: "SSH", 23: "Telnet",
+            25: "SMTP", 53: "DNS", 80: "HTTP", 110: "POP3",
+            143: "IMAP", 443: "HTTPS", 445: "SMB", 3306: "MySQL",
+            3389: "RDP", 5432: "PostgreSQL", 5900: "VNC", 8080: "HTTP-Proxy",
+            8443: "HTTPS-Alt", 27017: "MongoDB"
+        }
+        
+        service = common_ports.get(port, "Unknown")
+        
+        # Enhance identification with banner analysis
+        if banner:
+            banner_lower = banner.lower()
+            if 'ssh' in banner_lower:
+                service = "SSH"
+            elif 'ftp' in banner_lower:
+                service = "FTP"
+            elif 'http' in banner_lower or 'apache' in banner_lower or 'nginx' in banner_lower:
+                service = "HTTP"
+            elif 'smtp' in banner_lower or 'mail' in banner_lower:
+                service = "SMTP"
+            elif 'mysql' in banner_lower:
+                service = "MySQL"
+        
+        return service
+    
+    def worker(self, queue):
+        """
+        Worker thread function to process port scanning queue
+        
+        Args:
+            queue: Queue containing port numbers to scan
+        """
+        while not queue.empty():
+            port = queue.get()
+            self.scan_port(port)
+            queue.task_done()
+    
+    def scan_ports(self, ports, threads=50):
+        """
+        Scan multiple ports using threading for performance
+        
+        Args:
+            ports: List of port numbers or tuple (start, end) for range
+            threads: Number of concurrent threads to use
+        """
+        print(f"\n{'='*70}")
+        print(f"Port Scanner with Banner Grabbing")
+        print(f"{'='*70}")
+        print(f"Target: {self.target}")
+        print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*70}\n")
+        
+        # Handle port range
+        if isinstance(ports, tuple):
+            start, end = ports
+            ports = range(start, end + 1)
+        
+        # Create queue and fill with ports
+        queue = Queue()
+        for port in ports:
+            queue.put(port)
+        
+        # Create and start threads
+        thread_list = []
+        for _ in range(min(threads, len(ports))):
+            thread = threading.Thread(target=self.worker, args=(queue,))
+            thread.daemon = True
+            thread.start()
+            thread_list.append(thread)
+        
+        # Wait for all threads to complete
+        queue.join()
+        
+        # Print summary
+        print(f"\n{'='*70}")
+        print(f"Scan completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Total open ports found: {len(self.open_ports)}")
+        print(f"{'='*70}\n")
+        
+        return self.open_ports
+    
+    def generate_report(self, filename="scan_report.txt"):
+        """
+        Generate a detailed scan report
+        
+        Args:
+            filename: Output filename for the report
+        """
+        with open(filename, 'w') as f:
+            f.write(f"Port Scan Report\n")
+            f.write(f"{'='*70}\n")
+            f.write(f"Target: {self.target}\n")
+            f.write(f"Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total Open Ports: {len(self.open_ports)}\n")
+            f.write(f"{'='*70}\n\n")
+            
+            for port_info in sorted(self.open_ports, key=lambda x: x['port']):
+                f.write(f"Port: {port_info['port']}\n")
+                f.write(f"Service: {port_info['service']}\n")
+                if port_info['banner']:
+                    f.write(f"Banner: {port_info['banner']}\n")
+                f.write(f"{'-'*70}\n")
+        
+        print(f"\nReport saved to: {filename}")
+
+
+def main():
     """
-    Scan a single port on the target host
-    Returns True if port is open, False otherwise
+    Main function to run the port scanner
     """
+    # Configuration
+    target = "127.0.0.1"  # ONLY scan localhost or systems you own!
+    
+    print("\n⚠️  WARNING: Only scan systems you own or have permission to scan!")
+    print("Unauthorized scanning may be illegal.\n")
+    
+    # Validate target
     try:
-        # Create a socket object
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1)  # 1 second timeout
-        
-        # Attempt to connect
-        result = sock.connect_ex((target, port))
-        sock.close()
-        
-        return result == 0  # 0 means connection successful
-    except socket.error:
-        return False
+        socket.gethostbyname(target)
+    except socket.gaierror:
+        print(f"Error: Unable to resolve hostname: {target}")
+        sys.exit(1)
+    
+    # Initialize scanner
+    scanner = PortScanner(target, timeout=1)
+    
+    # Option 1: Scan common ports
+    common_ports = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 3306, 3389, 5432, 8080, 8443]
+    
+    # Option 2: Scan a range (uncomment to use)
+    # port_range = (1, 1024)  # Scan ports 1-1024
+    
+    # Run the scan
+    open_ports = scanner.scan_ports(common_ports, threads=50)
+    
+    # Generate report
+    if open_ports:
+        scanner.generate_report("scan_report.txt")
+    else:
+        print("\nNo open ports found.")
 
-def scan_ports(target, ports):
-    """
-    Scan multiple ports on a target host
-    """
-    print(f"\nScanning {target}")
-    print(f"Started at {datetime.now()}\n")
-    print("-" * 50)
-    
-    open_ports = []
-    
-    for port in ports:
-        if scan_port(target, port):
-            print(f"Port {port}: OPEN")
-            open_ports.append(port)
-    
-    print("-" * 50)
-    print(f"\nScan completed at {datetime.now()}")
-    print(f"Found {len(open_ports)} open ports")
-    
-    return open_ports
 
-# Example usage - ONLY scan localhost or systems you own
 if __name__ == "__main__":
-    # Scan common ports on localhost
-    target = "127.0.0.1"  # localhost - always safe to scan
-    common_ports = [21, 22, 23, 25, 80, 443, 3306, 8080]
-    
-    open_ports = scan_ports(target, common_ports)
+    main()
